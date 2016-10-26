@@ -35,4 +35,3 @@ def system(cmd):
 def log_error(msg):
     logger.error(msg)
     sys.exit(1)
-

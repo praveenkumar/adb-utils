@@ -33,10 +33,11 @@ spec:
     path: /nfsvolumes/pv{0}"""
 
 def configure_nfs():
-    logger.info("Configuring NFS")
-    subprocess.call("setsebool -P virt_use_nfs 1", shell=True)
-    subprocess.call("systemctl start nfs-server", shell=True)
-    subprocess.call("systemctl enable nfs-server", shell=True)
+    if "off" in subprocess.check_output("getsebool virt_use_nfs", shell=True):
+        logger.info("Configuring NFS")
+        subprocess.call("setsebool -P virt_use_nfs 1", shell=True)
+        subprocess.call("systemctl start nfs-server", shell=True)
+        subprocess.call("systemctl enable nfs-server", shell=True)
 
 def list_pv(path):
     return len(os.listdir(path))
@@ -56,6 +57,7 @@ def update_exports(path):
 
 def persistent_vol_setup(pv_number=3, pv_capacity=1):
     logger.info("Creating persistent volumes")
+    configure_nfs()
     if not os.path.isdir(NFS_Dir):
         try:
             create_dir(NFS_Dir)
@@ -78,7 +80,6 @@ def persistent_vol_setup(pv_number=3, pv_capacity=1):
         os.unlink(temp_file)
 
 def main():
-    configure_nfs()
     persistent_vol_setup()
 
 if __name__ == '__main__':

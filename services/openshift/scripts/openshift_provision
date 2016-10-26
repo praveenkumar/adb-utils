@@ -1,202 +1,29 @@
-#!/usr/bin/env bash
+#!/usr/bin/env python
 
-# Prepare, configure and start OpenShift
-
-set -o pipefail
-set -o nounset
-
-export ORIGIN_DIR="/var/lib/openshift"
-export OPENSHIFT_DIR=${ORIGIN_DIR}/openshift.local.config/master
-export KUBECONFIG=${OPENSHIFT_DIR}/admin.kubeconfig
-eval "OPENSHIFT_SUBDOMAIN=${OPENSHIFT_SUBDOMAIN}"
-
-# Function to check openshift availability
-wait_for_openshift_api() {
-    # Wait for container to show up
-    ATTEMPT=0
-    until docker inspect openshift > /dev/null 2>&1 || [ $ATTEMPT -eq 10 ]; do
-      sleep 1
-      ((ATTEMPT++))
-    done
-
-    # Use health URL to check OpenShift readiness
-    ATTEMPT=0
-    until curl -ksSf https://127.0.0.1:8443/healthz/ready > /dev/null 2>&1 || [ $ATTEMPT -eq 60 ]; do
-      sleep 1
-      ((ATTEMPT++))
-    done
-}
-
-wait_for_openshift_api
-
-# Copy OpenShift CLI tools to the VM
-# Binaries are copied every time in case there is a version change
-# Note: oc and oadm are symlinks to openshift
-binaries=(openshift oc oadm)
-for n in ${binaries[@]}; do
-  if [ ! -f /usr/bin/${n} ]; then
-      echo "[INFO] Copying ${n} binary to VM"
-      docker cp openshift:/usr/bin/${n} /usr/bin/${n}
-  fi
-done
-
-# Create Docker Registry
-if [ ! -f ${ORIGIN_DIR}/configured.registry ]; then
-  echo "[INFO] Configuring Docker Registry"
-  # oadm and oc both can able to create registry (check oc/oadm --help)
-  oadm registry --create --service-account=registry || exit 1
-  oadm policy add-scc-to-group anyuid system:authenticated || exit 1
-  touch ${ORIGIN_DIR}/configured.registry
-fi
-
-# For router, we have to create service account first and then use it for router creation.
-if [ ! -f ${ORIGIN_DIR}/configured.router ]; then
-  echo "[INFO] Configuring HAProxy router"
-  oadm policy add-scc-to-user privileged system:serviceaccount:default:router || exit 1
-  oadm router --service-account=router --expose-metrics=true || exit 1
-  touch ${ORIGIN_DIR}/configured.router
-
-  # Get machine IP address
-  registry_name="hub.openshift.${OPENSHIFT_SUBDOMAIN}"
-  oc expose service docker-registry --hostname ${registry_name}
-fi
+from provision import openshift_setup
+from provision import persistent_vol
+from argparse import ArgumentParser, RawTextHelpFormatter
 
 
-# Securing the Registry
-# https://docs.openshift.org/latest/install_config/install/docker_registry.html#securing-the-registry
-if [ ! -f ${ORIGIN_DIR}/secured.registry ]; then
-  # Public name for the registry
-  REGISTRY_ROUTE=$(oc get route docker-registry -o template --template='{{ .spec.host }}')
-
-  # Get IP and Port of the registry service
-  REGISTRY_SERVICE_IP=$(oc get svc/docker-registry -o template --template='{{ .spec.clusterIP }}')
-  REGISTRY_SERVICE_PORT=$(oc get svc/docker-registry -o template --template='{{ (index .spec.ports 0).port }}')
-
-  # Create certificates for registry
-  oadm ca create-server-cert --signer-cert=$OPENSHIFT_DIR/ca.crt \
-      --signer-key=$OPENSHIFT_DIR/ca.key --signer-serial=$OPENSHIFT_DIR/ca.serial.txt \
-      --hostnames="$REGISTRY_ROUTE,$REGISTRY_SERVICE_IP" \
-      --cert=$OPENSHIFT_DIR/registry.crt --key=$OPENSHIFT_DIR/registry.key
-
-  # Create the secret for the registry certificates
-  oc secrets new registry-secret $OPENSHIFT_DIR/registry.crt $OPENSHIFT_DIR/registry.key
-
-  # Add the secret volume to the registry deployment configuration:
-  oc volume dc/docker-registry --add --type=secret \
-      --secret-name=registry-secret -m /etc/secrets
-
-  # Enable TLS by adding the following environment variables to the registry deployment configuration
-  oc env dc/docker-registry \
-      REGISTRY_HTTP_TLS_CERTIFICATE=/etc/secrets/registry.crt \
-      REGISTRY_HTTP_TLS_KEY=/etc/secrets/registry.key
-
-  # Update the scheme used for the registry’s liveness probe from HTTP to HTTPS:
-  oc get dc/docker-registry -o yaml \
-      | sed -e 's/scheme: HTTP/scheme: HTTPS/g' \
-      | oc replace -f -
-
-  # Copy the CA certificate to the Docker certificates directory.
-  mkdir -p /etc/docker/certs.d/$REGISTRY_SERVICE_IP:$REGISTRY_SERVICE_PORT
-  cp $OPENSHIFT_DIR/ca.crt /etc/docker/certs.d/$REGISTRY_SERVICE_IP:$REGISTRY_SERVICE_PORT
-
-  mkdir -p /etc/docker/certs.d/$REGISTRY_ROUTE
-  cp $OPENSHIFT_DIR/ca.crt /etc/docker/certs.d/$REGISTRY_ROUTE
-
-  # add "tls termination: passthroug" to already existing docker registry route
-  oc get route docker-registry -o json  | sed -e 's/\("spec": {\)/\1 "tls": {"termination": "passthrough"},/g' | oc replace -f -
-fi
-
-
-# Provision persistence volumes
-if [ ! -f ${ORIGIN_DIR}/configured.nfs ]; then
-  echo "[INFO] Creating and configuring NFS"
-  mkdir -p /nfsvolumes/pv{01..03}
-  chown -R nfsnobody:nfsnobody /nfsvolumes
-  chmod -R 777 /nfsvolumes
-  echo '' > /etc/exports
-
-  for i in {01..03}
-  do
-    echo "/nfsvolumes/pv${i} *(rw,root_squash)" >> /etc/exports
-  done
-  # To allow pods to write to remote NFS servers
-  setsebool -P virt_use_nfs 1
-
-  # Start and enable nfs
-  systemctl start nfs-server
-  systemctl enable nfs-server
-
-  # Enable the new exports without bouncing the NFS service
-  exportfs -a
-
-  echo "[INFO] Creating 3 NFS PV {pv01..03} using from 1Gi  3Gi in ReadWriteMany or ReadWriteOnly mode and Recycle Policy."
-  for i in {1..3}
-  do
-  echo "apiVersion: v1
-kind: PersistentVolume
-metadata:
-  name: pv0${i}
-spec:
-  capacity:
-    storage: ${i}Gi
-  accessModes:
-    - ReadWriteOnce
-    - ReadWriteMany
-  persistentVolumeReclaimPolicy: Recycle
-  nfs:
-    server: localhost
-    path: /nfsvolumes/pv0${i}" | oc create -f -
-  done
-
-  touch ${ORIGIN_DIR}/configured.nfs
-fi
-
-# Installing templates into OpenShift
-if [ ! -f ${ORIGIN_DIR}/configured.templates ]; then
-  echo "[INFO] Installing OpenShift templates"
-
-  # TODO - These list must be verified and completed for a official release
-  # Currently templates are sources from three main repositories
-  # - openshift/origin
-  # - openshift/nodejs-ex
-  # - jboss-openshift/application-templates
-  ose_tag=ose-v1.2.0
-  template_list=(
-    #ImageStreams
-    /opt/adb/openshift/templates/image-streams-rhel7.json
-    /opt/adb/openshift/templates/jboss-image-streams.json
-    /opt/adb/openshift/templates/wildfly-image-streams.json
-
-    #EAP
-    /opt/adb/openshift/templates/eap64-mysql-persistent-s2i.json
-    /opt/adb/openshift/templates/eap64-basic-s2i.json
-
-    #WebApp
-    /opt/adb/openshift/templates/jws30-tomcat7-mysql-persistent-s2i.json
-    /opt/adb/openshift/templates/cakephp.json
-    /opt/adb/openshift/templates/cakephp-mysql.json
-
-    # Node.js
-    /opt/adb/openshift/templates/nodejs-mongodb.json
-    /opt/adb/openshift/templates/nodejs.json
-  )
-
-  for template in ${template_list[@]}; do
-    echo "[INFO] Importing template ${template}"
-    oc create -f $template -n openshift >/dev/null
-  done
-  touch ${ORIGIN_DIR}/configured.templates
-fi
-
-# Configuring a openshift-dev and admin user
-if [ ! -f ${ORIGIN_DIR}/configured.user ]; then
-  echo "[INFO] Adding required roles to openshift-dev and admin user ..."
-  oadm policy add-role-to-user basic-user openshift-dev --config=${OPENSHIFT_DIR}/admin.kubeconfig
-  oadm policy add-cluster-role-to-user cluster-admin admin --config=${OPENSHIFT_DIR}/admin.kubeconfig
-  su vagrant -l -c "oc login https://127.0.0.1:8443 -u openshift-dev -p devel \
-        --certificate-authority=${OPENSHIFT_DIR}/ca.crt &>/dev/null"
-  su vagrant -l -c "oc new-project sample-project --display-name='OpenShift sample project' \
-        --description='This is a sample project to demonstrate OpenShift v3' &>/dev/null"
-  touch ${ORIGIN_DIR}/configured.user
-fi
+if __name__ == '__main__':
+    parser = ArgumentParser(prog='openshift_provision',
+            description='CLI to provision OpenShift for different usecase',
+            formatter_class=RawTextHelpFormatter)
+    parser.add_argument('-s', '--setup', help="OpenShift basic Setup")
+    parser.add_argument('-a', '--addon', nargs="+",
+            help="""Enable an addon (persistent volume), cockpit, metrix, logging
+    $ openshift_provision -a pv <number_of_pv> <size_of_pv> default(3, 1Gb)
+    $ openshift_provision -a metrix
+    $ openshift_provision -a cockpit
+    $ openshift_provision -a logging""")
+    args = parser.parse_args()
+    if args.setup:
+        openshift_setup()
+    else:
+        addon_name = args.addon[0]
+        if addon_name == 'pv':
+            number_of_pv = args.addon[1] if args.addon[1:] else 3
+            size_of_pv = args.addon[2] if args.addon[2:] else 1
+            persistent_vol.persistent_vol_setup(int(number_of_pv),
+                                                int(size_of_pv))
 

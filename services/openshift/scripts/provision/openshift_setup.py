@@ -10,7 +10,7 @@ import time
 import tempfile
 from argparse import ArgumentParser
 from utils import ORIGIN_DIR, OPENSHIFT_DIR, OPENSHIFT_SUBDOMAIN
-from utils import system, log_error
+from utils import system, log_error, logger
 
 os.environ['KUBECONFIG'] = "%s/admin.kubeconfig" % OPENSHIFT_DIR
 
@@ -184,4 +184,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
